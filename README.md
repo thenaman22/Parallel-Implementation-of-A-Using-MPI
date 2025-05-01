@@ -7,8 +7,14 @@ To run the file, use the following command.
 The output for the file would be displayed.
 
 Example of Command to run file:
+
+
             '''
+
                 make
+
                 mpirun -np 4 ./A_Star -f ./Input/Input_simple.txt 0 0 4 4
+                
                 mpirun -np 4 ./A_Star -f ./Input/Input_maze_100.txt 0 0 99 99
+
             '''
