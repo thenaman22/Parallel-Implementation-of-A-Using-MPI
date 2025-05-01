@@ -340,7 +340,6 @@ void parallel_aStar(int start_point, int destination, grid_t* grid, vector<int> 
     // path found
     if (curr == destination) {
       double endSearchTime = MPI_Wtime();
-      printf("Total time to find destination node %d: %f\n", rank, endSearchTime-startTime);
       make_path(parent, curr, path);
       int new_cost = path->size();
 
@@ -374,7 +373,6 @@ void parallel_aStar(int start_point, int destination, grid_t* grid, vector<int> 
       if (new_cost < pathCost) {
         
         double endPathTime = MPI_Wtime();
-        printf("Time to find path  %d: %f\n", rank, endPathTime-startTime);
         for (int i = 0; i < nproc; i++) {
           MPI_Isend(&new_cost, 1, MPI_INT, i, nproc+1, MPI_COMM_WORLD, &cost_reqs[i]);
         }
@@ -450,7 +448,7 @@ int main(int argc, char *argv[]) {
     if(!rank){
       
       if (spath->size() != 0) {
-          cout << spath->size() << endl;
+          cout <<"Path length: "<< spath->size() << endl;
           for (auto n = spath->rbegin(); n != spath->rend(); n++) {
             cout << "(" <<  *n / grid->dim << "," << *n % grid->dim << ") "; 
           }
@@ -463,14 +461,15 @@ int main(int argc, char *argv[]) {
     double end = MPI_Wtime();
     if(!rank){
       cout<<"Ending time :: Serial: "<<end - start<<endl;
-      cout<<"Execution Time  :: Parallel:  "<<end_s - start_s<<endl;
+      
       if (spath->size() != 0) {
-          cout << spath->size() << endl;
+          cout <<"Path length: "<<spath->size() << endl;
           for (auto n = spath->rbegin(); n != spath->rend(); n++) {
             cout << "(" <<  *n / grid->dim << "," << *n % grid->dim << ") "; 
           }
           cout<<endl;
       }
+      cout<<"Execution Time  :: Parallel:  "<<end_s - start_s<<endl;
     }
     
     MPI_Finalize();
