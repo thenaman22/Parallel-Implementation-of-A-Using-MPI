@@ -1,481 +1,757 @@
 #include "mpi.h"
-#include <unistd.h>
-#include <ctype.h>
-#include <queue>
-#include <unordered_map>
-#include <climits>
-#include <unordered_set>
-#include <assert.h>
-#include <chrono>
+
+#include <algorithm>
 #include <cmath>
-#include <fstream>
-#include <vector>
-#include <iostream>
-#include <sstream>
-#include <memory>
 #include <cstddef>
-#include <functional>
+#include <exception>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <list>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-using namespace std;
+namespace {
 
-#ifndef _grid_H
-#define _grid_H
+constexpr int INF = std::numeric_limits<int>::max() / 4;
+constexpr int ROOT_RANK = 0;
 
-MPI_Request node_reqs[64];
-MPI_Request cost_reqs[64];
-MPI_Request parent_reqs[64];
-MPI_Status node_stats[64];
-MPI_Status cost_stats[64];
-MPI_Status parent_stats[64];
-
-typedef struct {
-  int cost;   // the current path score f(n) 
-  int node;   // the index corresponding to the node
-} info_node;
-
-struct compare_nodes {
-    bool operator()(info_node const & x, info_node const & y) {
-        return x.cost > y.cost;
-    }
+enum Tags {
+  TAG_NODE_UPDATE = 100
 };
 
-struct grid_t {
-  int dim;     
-  int *grid;   // Represented as a 1D array where [i][j] => [i*dim + j] 
-  grid_t(const int d, int *g) : dim(d), grid(g) {};
+// Grid cells are stored in a flat vector using row * dim + col indexing.
+struct Grid {
+  int dim = 0;
+  std::vector<int> cells;
+
+  bool in_bounds(int row, int col) const {
+    return row >= 0 && row < dim && col >= 0 && col < dim;
+  }
+
+  bool valid_node(int node) const {
+    return node >= 0 && node < static_cast<int>(cells.size());
+  }
+
+  bool passable(int node) const {
+    return valid_node(node) && cells[node] == 1;
+  }
+
+  int node(int row, int col) const {
+    return row * dim + col;
+  }
+
+  std::pair<int, int> coord(int node_id) const {
+    return {node_id / dim, node_id % dim};
+  }
+
+  std::vector<int> neighbors(int node_id) const {
+    std::vector<int> result;
+    result.reserve(4);
+
+    const auto [row, col] = coord(node_id);
+
+    if (in_bounds(row - 1, col)) {
+      const int up = node(row - 1, col);
+      if (passable(up)) {
+        result.push_back(up);
+      }
+    }
+    if (in_bounds(row + 1, col)) {
+      const int down = node(row + 1, col);
+      if (passable(down)) {
+        result.push_back(down);
+      }
+    }
+    if (in_bounds(row, col - 1)) {
+      const int left = node(row, col - 1);
+      if (passable(left)) {
+        result.push_back(left);
+      }
+    }
+    if (in_bounds(row, col + 1)) {
+      const int right = node(row, col + 1);
+      if (passable(right)) {
+        result.push_back(right);
+      }
+    }
+
+    return result;
+  }
 };
 
-#endif 
+struct QueueItem {
+  int f = INF;
+  int g = INF;
+  int node = -1;
+};
 
-grid_t* readgrid(int x, int y, int a, int b, char *filename) {
-  int dim; 
-
-	FILE *input = fopen(filename, "r");
-	if (!input) { 
-		cout<<"Cant open file: "<<filename<<endl;
-		return {};
-	}
-
-  // Read the dimension of the grid
-  fscanf(input, "%d\n", &dim);
-
-  if (x < 0 || x >= dim || y < 0 || y >= dim) {
-    cout<<"out of bounds error"<<endl;
-    return {};
-  }
-  if (a < 0 || a >= dim || b < 0 || b >= dim) {
-    cout<<"out of bounds error"<<endl;
-    return {};
-  }
-
-  int *grid = (int *)malloc(dim*dim*sizeof(int));
-
-
-  int line_len = 2*dim+1;
-  char* line = (char *)malloc(line_len);
-  int line_cnt = 0;
-  int node_cnt = 0;
-
-  while (fgets(line, line_len, input))  {
-    node_cnt = 0;
-    for (int i = 0; i < line_len - 2; i++) {
-      if (!isspace(line[i])) {
-        grid[dim*line_cnt + node_cnt] = (int)(line[i] - '0');
-        node_cnt++;
-      }
+struct QueueCompare {
+  bool operator()(const QueueItem& lhs, const QueueItem& rhs) const {
+    if (lhs.f != rhs.f) {
+      return lhs.f > rhs.f;
     }
-    line_cnt++;
+    if (lhs.g != rhs.g) {
+      return lhs.g > rhs.g;
+    }
+    return lhs.node > rhs.node;
   }
-  fclose(input);
-  free(line);
-  return new grid_t(dim, grid);
+};
+
+struct NodeUpdate {
+  int node = -1;
+  int g = INF;
+  int parent = -1;
+};
+
+struct PendingNodeSend {
+  NodeUpdate msg;
+  MPI_Request request = MPI_REQUEST_NULL;
+};
+
+struct ParallelResult {
+  std::vector<int> path;
+  int goal_cost = INF;
+  bool found = false;
+  bool path_valid = false;
+};
+
+using OpenQueue = std::priority_queue<QueueItem, std::vector<QueueItem>, QueueCompare>;
+
+int to_node(int row, int col, int dim) {
+  return row * dim + col;
 }
 
-grid_t* grid;
-
-
-// _rqst status variables 
-
-
-// heuristic function 
-int heuristic(int start_point, int destination) {
-  int start_point_R = start_point / grid->dim;
-  int start_point_C = start_point % grid->dim;
-  int destination_R = destination / grid->dim;
-  int destination_C = destination % grid->dim;
-  // manhatten distance 
-  return abs(start_point_R - destination_R) + abs(start_point_C - destination_C);
+std::pair<int, int> to_coord(int node, int dim) {
+  return {node / dim, node % dim};
 }
 
-
-vector<int> find_neigbours(int curr, grid_t* grid) {
-  int currR = curr / grid->dim;
-  int currC = curr % grid->dim;
-  int lim = grid->dim - 1;
-  vector<int> nbrs;
-  if (currR != 0 && grid->grid[curr - grid->dim] == 1)    nbrs.push_back(curr - grid->dim); // UP
-  if (currR < lim && grid->grid[curr + grid->dim] == 1)   nbrs.push_back(curr + grid->dim);   // DOWN
-  if (currC != 0 && grid->grid[curr - 1] == 1)    nbrs.push_back(curr - 1);  // LEFT 
-  if (currC < lim && grid->grid[curr + 1] == 1)   nbrs.push_back(curr + 1); // RIGHT
-  return nbrs;
+int heuristic(int node, int goal, const Grid& grid) {
+  const auto [node_row, node_col] = to_coord(node, grid.dim);
+  const auto [goal_row, goal_col] = to_coord(goal, grid.dim);
+  return std::abs(goal_row - node_row) + std::abs(goal_col - node_col);
 }
 
-
-
-void make_path(unordered_map<int, int> parent, int curr, vector<int> *path) {
-  path->clear();
-  path->push_back(curr);
-  while (parent.find(curr) != parent.end()) {
-    curr = parent.at(curr);
-    path->push_back(curr);
+// Deterministically assigns each node to one MPI rank.
+int owner(int node, int nproc) {
+  constexpr double A = (std::sqrt(5.0) - 1.0) / 2.0;
+  const double x = static_cast<double>(node) * A;
+  const double fractional = x - std::floor(x);
+  int result = static_cast<int>(std::floor(static_cast<double>(nproc) * fractional));
+  if (result < 0) {
+    result = 0;
   }
+  if (result >= nproc) {
+    result = nproc - 1;
+  }
+  return result;
 }
 
+bool read_grid(const std::string& filename,
+               int start_row,
+               int start_col,
+               int goal_row,
+               int goal_col,
+               Grid& grid,
+               std::string& error) {
+  if (filename.empty()) {
+    error = "missing input filename";
+    return false;
+  }
 
-vector<int> seq_aStar(int source, int target, grid_t* grid) {
-  priority_queue<info_node, vector<info_node>, compare_nodes> pq;
-  unordered_set<int> open_list;
-  unordered_map<int, int> parent;
-  unordered_map<int, int> cost_score;
-  vector<int> path;
+  std::ifstream input(filename);
+  if (!input) {
+    error = "could not open file: " + filename;
+    return false;
+  }
 
-  pq.push({heuristic(source, target), source});
-  open_list.insert(source);
+  int dim = 0;
+  if (!(input >> dim) || dim <= 0) {
+    error = "invalid grid dimension";
+    return false;
+  }
 
-  cost_score.insert({source, 0});
+  grid.dim = dim;
+  grid.cells.assign(static_cast<std::size_t>(dim) * static_cast<std::size_t>(dim), 0);
 
-  for (int i = 0; i < grid->dim; i++) {
-    for (int j = 0; j < grid->dim; j++) {
-      if (i != source / grid->dim || j != source % grid->dim) {
-        cost_score.insert({i*grid->dim + j, INT_MAX});
+  for (int row = 0; row < dim; ++row) {
+    for (int col = 0; col < dim; ++col) {
+      int value = -1;
+      if (!(input >> value)) {
+        error = "grid ended early while reading row " + std::to_string(row);
+        return false;
       }
+      if (value != 0 && value != 1) {
+        error = "grid values must be 0 or 1";
+        return false;
+      }
+      grid.cells[static_cast<std::size_t>(to_node(row, col, dim))] = value;
     }
   }
 
-  vector<int> neighbors;
-  while (!pq.empty()) {
-    int current = pq.top().node;
-    if (current == target) {
-      make_path(parent, current, &path);
+  int extra_value = 0;
+  if (input >> extra_value) {
+    error = "grid contains extra values after the expected " +
+            std::to_string(dim * dim) + " cells";
+    return false;
+  }
+
+  if (!grid.in_bounds(start_row, start_col) || !grid.in_bounds(goal_row, goal_col)) {
+    error = "start or goal is out of bounds";
+    return false;
+  }
+
+  const int start = grid.node(start_row, start_col);
+  const int goal = grid.node(goal_row, goal_col);
+  if (!grid.passable(start)) {
+    error = "start node is blocked";
+    return false;
+  }
+  if (!grid.passable(goal)) {
+    error = "goal node is blocked";
+    return false;
+  }
+
+  return true;
+}
+
+bool relax_node(int node,
+                int tentative_g,
+                int parent_node,
+                int goal,
+                const Grid& grid,
+                std::unordered_map<int, int>& g_cost,
+                std::unordered_map<int, int>& parent,
+                OpenQueue& open) {
+  // We only keep strictly better g-costs. Lower-priority duplicates stay in the
+  // heap and get discarded later when they become stale.
+  const auto current = g_cost.find(node);
+  if (current != g_cost.end() && tentative_g >= current->second) {
+    return false;
+  }
+
+  g_cost[node] = tentative_g;
+  if (parent_node >= 0) {
+    parent[node] = parent_node;
+  } else {
+    parent.erase(node);
+  }
+
+  open.push({tentative_g + heuristic(node, goal, grid), tentative_g, node});
+  return true;
+}
+
+void discard_stale_frontier(OpenQueue& open, const std::unordered_map<int, int>& g_cost) {
+  while (!open.empty()) {
+    const QueueItem item = open.top();
+    const auto current = g_cost.find(item.node);
+    // priority_queue has no decrease-key, so old entries are expected.
+    if (current == g_cost.end() || current->second != item.g) {
+      open.pop();
+      continue;
+    }
+    break;
+  }
+}
+
+void prune_completed_sends(std::list<PendingNodeSend>& pending_sends) {
+  for (auto it = pending_sends.begin(); it != pending_sends.end();) {
+    int completed = 0;
+    MPI_Test(&it->request, &completed, MPI_STATUS_IGNORE);
+    if (completed != 0) {
+      it = pending_sends.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void wait_for_pending_sends(std::list<PendingNodeSend>& pending_sends) {
+  for (auto& pending : pending_sends) {
+    MPI_Wait(&pending.request, MPI_STATUS_IGNORE);
+  }
+  pending_sends.clear();
+}
+
+void send_node_update_safely(int recipient,
+                             const NodeUpdate& msg,
+                             MPI_Datatype node_update_type,
+                             std::list<PendingNodeSend>& pending_sends,
+                             long long& sent_updates) {
+  // Keep the message storage alive until MPI reports the send request complete.
+  pending_sends.push_back({msg, MPI_REQUEST_NULL});
+  PendingNodeSend& pending = pending_sends.back();
+  MPI_Isend(&pending.msg,
+            1,
+            node_update_type,
+            recipient,
+            TAG_NODE_UPDATE,
+            MPI_COMM_WORLD,
+            &pending.request);
+  ++sent_updates;
+}
+
+void drain_incoming_messages(int rank,
+                             int nproc,
+                             int goal,
+                             const Grid& grid,
+                             MPI_Datatype node_update_type,
+                             std::unordered_map<int, int>& g_cost,
+                             std::unordered_map<int, int>& parent,
+                             OpenQueue& open,
+                             long long& received_updates) {
+  while (true) {
+    int available = 0;
+    MPI_Status status{};
+    MPI_Iprobe(MPI_ANY_SOURCE, TAG_NODE_UPDATE, MPI_COMM_WORLD, &available, &status);
+    if (available == 0) {
       break;
     }
 
-    pq.pop();
-    open_list.erase(current);
-    neighbors = find_neigbours(current, grid);
-    for (int neighbor: neighbors) { 
-      int neighborScore = cost_score.at(neighbor);
-      int currentScore = cost_score.at(current) + 1;
-      if (currentScore < neighborScore) {
-        if (parent.find(current) != parent.end()) {
-          if (parent.at(current) != neighbor) {
-            parent.emplace(neighbor, current);
-          }
-        } else {
-          parent.emplace(neighbor, current);
-        }
-        cost_score.erase(neighbor);
-        cost_score.emplace(neighbor, currentScore);
-        int neighborfScore = currentScore + heuristic(neighbor, target);
-        if (open_list.find(neighbor) == open_list.end()) {
-          open_list.emplace(neighbor);
-          pq.push({neighborfScore, neighbor});
-        }
-      }
-    }
-    neighbors.clear();
-    assert(pq.size() == open_list.size());
-  }
+    NodeUpdate update;
+    MPI_Recv(&update,
+             1,
+             node_update_type,
+             status.MPI_SOURCE,
+             status.MPI_TAG,
+             MPI_COMM_WORLD,
+             MPI_STATUS_IGNORE);
+    ++received_updates;
 
-  return path;
+    // Every update should already be routed to the owning rank, but this check
+    // keeps the local state honest if a bad message ever appears.
+    if (owner(update.node, nproc) != rank) {
+      continue;
+    }
+
+    relax_node(update.node, update.g, update.parent, goal, grid, g_cost, parent, open);
+  }
 }
 
-void parallel_aStar(int start_point, int destination, grid_t* grid, vector<int> *path, int nproc, int rank) {
-
-  priority_queue<info_node, vector<info_node>, compare_nodes> pq;
-  unordered_set<int> open_list;
-  unordered_map<int, int> parent;
-  unordered_map<int, int> g_cost;  
-  unordered_set<int> closed_list;
-
-  int pathCost = INT_MAX;
-  int valid_path_flag = 0;
-
-  double startTime = MPI_Wtime();
-  double A = (sqrt(5) - 1) / 2; // for hashing
-
-  int recv_proc = floor(nproc*(0*A - floor(0*A)));
-
-  if (rank == recv_proc) {
-    pq.push({heuristic(start_point, destination), start_point});
-    open_list.insert(start_point);
-
-
+std::vector<int> reconstruct_path(const std::unordered_map<int, int>& parent,
+                                  int start,
+                                  int goal) {
+  if (start == goal) {
+    return {start};
   }
-  g_cost.insert({start_point, 0});
-  
 
-  
-  for (int i = 0; i < grid->dim; i++) {
-    for (int j = 0; j < grid->dim; j++) {
-      if (i != start_point / grid->dim || j != start_point % grid->dim) {
-        g_cost.insert({i*grid->dim + j, INT_MAX});
-      }
+  std::vector<int> reversed_path;
+  reversed_path.push_back(goal);
+
+  int current = goal;
+  const std::size_t max_steps = parent.size() + 1;
+
+  while (current != start) {
+    const auto it = parent.find(current);
+    if (it == parent.end()) {
+      return {};
+    }
+    current = it->second;
+    reversed_path.push_back(current);
+    if (reversed_path.size() > max_steps + 1) {
+      return {};
     }
   }
 
-  int pathCost_buffer;
-  int Recv_buffer[3];
-  int Send_buffer[3];
-  int parent_buffer[2];
+  std::reverse(reversed_path.begin(), reversed_path.end());
+  return reversed_path;
+}
 
-  vector<int> nbrs;
-  int node_left_rqst = 0;
-  int path_left = 0;
-  int parents_left = 0;
+int path_cost(const std::vector<int>& path) {
+  if (path.empty()) {
+    return INF;
+  }
+  return static_cast<int>(path.size()) - 1;
+}
 
-  while (true) { 
-    int ready;
-    if (!node_left_rqst) {
-      // check whether or not a node is ready to be processed
-      MPI_Irecv(&Recv_buffer, 3, MPI_INT, MPI_ANY_SOURCE, rank, MPI_COMM_WORLD, &node_reqs[rank]);
-      node_left_rqst = 1;
+std::vector<int> seq_aStar(int start, int goal, const Grid& grid) {
+  OpenQueue open;
+  std::unordered_map<int, int> g_cost;
+  std::unordered_map<int, int> parent;
+
+  // The sequential run is the correctness baseline for the MPI version.
+  relax_node(start, 0, -1, goal, grid, g_cost, parent, open);
+
+  while (true) {
+    discard_stale_frontier(open, g_cost);
+    if (open.empty()) {
+      break;
     }
-    MPI_Test(&node_reqs[rank], &ready, &node_stats[rank]);
-    
-    if (ready) {
-      node_left_rqst = 0; 
-      // _bufferfer can be processed 
-      int nbr = Recv_buffer[0];
-      int curr_cost = Recv_buffer[1];
-      int curr = Recv_buffer[2]; 
-      int nbr_fscore = curr_cost + heuristic(nbr, destination);
-      int nbr_score = g_cost.at(nbr);
-      if (closed_list.find(nbr) != closed_list.end()) {
-        if (curr_cost < nbr_score) {
-          closed_list.erase(nbr);
-          open_list.insert(nbr);
-          pq.push({nbr_fscore, nbr});
-        } else {
-          continue;
+
+    const QueueItem current = open.top();
+    open.pop();
+
+    if (current.node == goal) {
+      return reconstruct_path(parent, start, goal);
+    }
+
+    for (const int neighbor : grid.neighbors(current.node)) {
+      relax_node(neighbor, current.g + 1, current.node, goal, grid, g_cost, parent, open);
+    }
+  }
+
+  return {};
+}
+
+std::vector<int> flatten_parent_map(const std::unordered_map<int, int>& parent) {
+  std::vector<int> flat;
+  flat.reserve(parent.size() * 2);
+  for (const auto& entry : parent) {
+    flat.push_back(entry.first);
+    flat.push_back(entry.second);
+  }
+  return flat;
+}
+
+ParallelResult parallel_aStar(int start,
+                              int goal,
+                              const Grid& grid,
+                              int nproc,
+                              int rank,
+                              MPI_Datatype node_update_type) {
+  OpenQueue open;
+  std::unordered_map<int, int> g_cost;
+  std::unordered_map<int, int> parent;
+  std::list<PendingNodeSend> pending_sends;
+
+  long long sent_updates = 0;
+  long long received_updates = 0;
+
+  int local_best_goal = INF;
+  int global_best_goal = INF;
+
+  // Only the owner of the start node seeds the distributed frontier.
+  if (rank == owner(start, nproc)) {
+    relax_node(start, 0, -1, goal, grid, g_cost, parent, open);
+  }
+
+  while (true) {
+    prune_completed_sends(pending_sends);
+    drain_incoming_messages(rank,
+                            nproc,
+                            goal,
+                            grid,
+                            node_update_type,
+                            g_cost,
+                            parent,
+                            open,
+                            received_updates);
+    discard_stale_frontier(open, g_cost);
+
+    if (!open.empty() && open.top().f < global_best_goal) {
+      const QueueItem current = open.top();
+      open.pop();
+
+      if (current.node == goal) {
+        // Store the best complete path cost seen by this rank; the collective
+        // min below makes it visible to the rest of the search.
+        if (current.g < local_best_goal) {
+          local_best_goal = current.g;
         }
       } else {
-        if (open_list.find(nbr) == open_list.end()) {
-          open_list.insert(nbr);
-          pq.push({nbr_fscore, nbr});
-        } else if (curr_cost >= nbr_score) {
-          continue;
-        }
-      }
-
-      parent_buffer[0] = nbr;
-      
-      parent_buffer[1] = curr;
-      
-      for (int i = 0; i < nproc; i++) {
-        MPI_Isend(&parent_buffer, 2, MPI_INT, i, nproc, MPI_COMM_WORLD, &parent_reqs[i]);
-      }
-
-      g_cost.erase(nbr);
-      g_cost.emplace(nbr, curr_cost);    
-    }
-    
-    
-    int parentUpdate; 
-    if (!parents_left) {
-      MPI_Irecv(&parent_buffer, 2, MPI_INT, MPI_ANY_SOURCE, nproc, MPI_COMM_WORLD, &parent_reqs[rank]);
-      parents_left = 1;
-    }
-
-    MPI_Test(&parent_reqs[rank], &parentUpdate, &parent_stats[rank]);
-
-
-    if(parentUpdate) {
-      parents_left = 0;
-      int nbr = parent_buffer[0];
-      int curr = parent_buffer[1];
-      if (parent.find(curr) != parent.end()) {
-          if (parent.at(curr) != nbr) {
-            parent.erase(nbr);
-            parent.emplace(nbr, curr);
+        for (const int neighbor : grid.neighbors(current.node)) {
+          const int tentative_g = current.g + 1;
+          if (tentative_g >= global_best_goal) {
+            continue;
           }
-        } else {
-          parent.erase(nbr);
-          parent.emplace(nbr, curr);
-      }
-    }
-    
-    int new_cost_flag;
-    if (!path_left) {
-      MPI_Irecv(&pathCost_buffer, 1, MPI_INT, MPI_ANY_SOURCE, nproc+1, MPI_COMM_WORLD, &cost_reqs[rank]);
-      path_left = 1;
-    }
-    
-    MPI_Test(&cost_reqs[rank], &new_cost_flag, &cost_stats[rank]);
-    if (new_cost_flag) {
-      path_left = 0;
-      if (!valid_path_flag || pathCost_buffer < pathCost) {
-        valid_path_flag = 1;
-        pathCost = pathCost_buffer;
-      }
-    }
 
-    if (pq.empty() || pq.top().cost >= pathCost) {
-      if (valid_path_flag) {
-        MPI_Status doneStatus;
-        int done;
-        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &done, &doneStatus);
-        if (done == 0) {
-          break;
-        }
-      }
-      continue;
-    }
-    
-    int curr = pq.top().node;
-    pq.pop();
-    open_list.erase(curr);
-    closed_list.insert(curr);
-
-    // path found
-    if (curr == destination) {
-      double endSearchTime = MPI_Wtime();
-      make_path(parent, curr, path);
-      int new_cost = path->size();
-
-      while (new_cost < 2 || path->back() != start_point) {
-        
-        int parentUpdate; 
-        if (!parents_left) {
-          MPI_Irecv(&parent_buffer, 2, MPI_INT, MPI_ANY_SOURCE, nproc, MPI_COMM_WORLD, &parent_reqs[rank]);
-          parents_left = 1;
-        }
-
-        MPI_Test(&parent_reqs[rank], &parentUpdate, &parent_stats[rank]);
-        if(parentUpdate) {
-          parents_left = 0;
-          int nbr = parent_buffer[0];
-          int curr = parent_buffer[1];
-          if (parent.find(curr) != parent.end()) {
-              if (parent.at(curr) != nbr) {
-                parent.erase(nbr);
-                parent.emplace(nbr, curr);
-              }
-            } else {
-              parent.erase(nbr);
-              parent.emplace(nbr, curr);
+          const int target_rank = owner(neighbor, nproc);
+          if (target_rank == rank) {
+            // Fast path: keep the update local when we already own the node.
+            relax_node(neighbor,
+                       tentative_g,
+                       current.node,
+                       goal,
+                       grid,
+                       g_cost,
+                       parent,
+                       open);
+          } else {
+            send_node_update_safely(target_rank,
+                                    {neighbor, tentative_g, current.node},
+                                    node_update_type,
+                                    pending_sends,
+                                    sent_updates);
           }
         }
-        make_path(parent, curr, path);
-        new_cost = path->size();
       }
-      
-      if (new_cost < pathCost) {
-        
-        double endPathTime = MPI_Wtime();
-        for (int i = 0; i < nproc; i++) {
-          MPI_Isend(&new_cost, 1, MPI_INT, i, nproc+1, MPI_COMM_WORLD, &cost_reqs[i]);
-        }
-      }
-      continue;
     }
 
-    nbrs = find_neigbours(curr, grid);
-    for (int nbr: nbrs) {
-      int curr_cost = g_cost.at(curr) + 1;
-      Send_buffer[0] = nbr;
-      Send_buffer[1] = curr_cost;
-      Send_buffer[2] = curr;
-      int recipient = floor(nproc*(nbr*A - floor(nbr*A)));;
-      MPI_Isend(&Send_buffer, 3, MPI_INT, recipient, recipient, MPI_COMM_WORLD, &node_reqs[recipient]);
+    prune_completed_sends(pending_sends);
+
+    int reduced_best_goal = INF;
+    MPI_Allreduce(&local_best_goal,
+                  &reduced_best_goal,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  MPI_COMM_WORLD);
+    global_best_goal = reduced_best_goal;
+
+    discard_stale_frontier(open, g_cost);
+    const int local_active = (!open.empty() && open.top().f < global_best_goal) ? 1 : 0;
+
+    int any_active = 0;
+    MPI_Allreduce(&local_active, &any_active, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+    long long local_message_counts[2] = {sent_updates, received_updates};
+    long long global_message_counts[2] = {0, 0};
+    MPI_Allreduce(local_message_counts,
+                  global_message_counts,
+                  2,
+                  MPI_LONG_LONG,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    // Terminate only after every process is idle and every node update has been received.
+    if (any_active == 0 && global_message_counts[0] == global_message_counts[1]) {
+      break;
     }
-    nbrs.clear();
   }
+
+  wait_for_pending_sends(pending_sends);
+
+  ParallelResult result;
+  result.goal_cost = global_best_goal;
+  result.found = global_best_goal < INF;
+  result.path_valid = !result.found;
+
+  const std::vector<int> local_parent_data = flatten_parent_map(parent);
+  const int local_parent_count = static_cast<int>(local_parent_data.size());
+
+  std::vector<int> counts;
+  std::vector<int> displacements;
+  std::vector<int> gathered_parent_data;
+
+  if (rank == ROOT_RANK) {
+    counts.resize(nproc, 0);
+  }
+
+  MPI_Gather(&local_parent_count,
+             1,
+             MPI_INT,
+             rank == ROOT_RANK ? counts.data() : nullptr,
+             1,
+             MPI_INT,
+             ROOT_RANK,
+             MPI_COMM_WORLD);
+
+  if (rank == ROOT_RANK) {
+    displacements.resize(nproc, 0);
+    int total = 0;
+    for (int i = 0; i < nproc; ++i) {
+      displacements[i] = total;
+      total += counts[i];
+    }
+    gathered_parent_data.resize(total);
+  }
+
+  MPI_Gatherv(local_parent_data.empty() ? nullptr : local_parent_data.data(),
+              local_parent_count,
+              MPI_INT,
+              rank == ROOT_RANK ? gathered_parent_data.data() : nullptr,
+              rank == ROOT_RANK ? counts.data() : nullptr,
+              rank == ROOT_RANK ? displacements.data() : nullptr,
+              MPI_INT,
+              ROOT_RANK,
+              MPI_COMM_WORLD);
+
+  if (rank == ROOT_RANK && result.found) {
+    // Path reconstruction is centralized after termination so we do not depend
+    // on parent updates racing the search itself.
+    std::unordered_map<int, int> merged_parent;
+    merged_parent.reserve(gathered_parent_data.size() / 2 + 1);
+
+    for (std::size_t i = 0; i + 1 < gathered_parent_data.size(); i += 2) {
+      merged_parent[gathered_parent_data[i]] = gathered_parent_data[i + 1];
+    }
+
+    result.path = reconstruct_path(merged_parent, start, goal);
+    result.path_valid = !result.path.empty() && path_cost(result.path) == result.goal_cost;
+  }
+
+  return result;
 }
 
-int main(int argc, char *argv[]) {
-    int rank;
-    int nproc;
-    char* filename = NULL;
+MPI_Datatype create_node_update_type() {
+  NodeUpdate sample;
+  MPI_Datatype node_update_type = MPI_DATATYPE_NULL;
 
-    int x1 = -1;
-    int y1 = -1;
-    int x2 = -1;
-    int y2 = -1;
+  int block_lengths[3] = {1, 1, 1};
+  MPI_Aint offsets[3];
+  MPI_Aint base = 0;
+  MPI_Datatype types[3] = {MPI_INT, MPI_INT, MPI_INT};
 
-    MPI_Init(&argc, &argv);
+  MPI_Get_address(&sample, &base);
+  MPI_Get_address(&sample.node, &offsets[0]);
+  MPI_Get_address(&sample.g, &offsets[1]);
+  MPI_Get_address(&sample.parent, &offsets[2]);
 
-   
-    vector<int> coords;    
+  offsets[0] -= base;
+  offsets[1] -= base;
+  offsets[2] -= base;
 
-    for (int i = 1; i < argc; ++i) {
-        string arg = argv[i];
-        if (arg == "-f") {
-            if (i + 1 < argc) {
-                filename = argv[++i];
-            } else {
-                cerr << "Error: '-f' requires a filename\n";
-                MPI_Finalize();
-                return -1;
-            }
-        }
-        else if (coords.size() < 4) {
-          coords.push_back(stoi(arg));
-        }
-        
+  MPI_Type_create_struct(3, block_lengths, offsets, types, &node_update_type);
+  MPI_Type_commit(&node_update_type);
+  return node_update_type;
+}
+
+void print_path(std::ostream& out, const std::vector<int>& path, const Grid& grid) {
+  if (path.empty()) {
+    out << "NO PATH\n";
+    return;
+  }
+
+  for (std::size_t i = 0; i < path.size(); ++i) {
+    const auto [row, col] = grid.coord(path[i]);
+    out << "(" << row << "," << col << ")";
+    if (i + 1 != path.size()) {
+      out << " ";
     }
+  }
+  out << '\n';
+}
 
-    if (coords.size() != 4) {
-        cerr << "Usage: " << argv[0]<< " -f <filename> <x1> <y1> <x2> <y2>\n";
+}  // namespace
+
+int main(int argc, char* argv[]) {
+  MPI_Init(&argc, &argv);
+
+  int rank = 0;
+  int nproc = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
+  std::string filename;
+  std::vector<int> coords;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-f") {
+      if (i + 1 >= argc) {
+        if (rank == ROOT_RANK) {
+          std::cerr << "Error: '-f' requires a filename\n";
+        }
         MPI_Finalize();
         return -1;
-    }
-
-    x1 = coords[0], y1 = coords[1], x2 = coords[2], y2 = coords[3];
-
-    grid = readgrid(x1, y1, x2, y2, filename);
-    int start_point = x1 * grid->dim + y1;
-    int destination = x2 * grid->dim + y2;
-
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nproc);
-    vector<int>* spath;
-    vector<int> path_s;
-    double start_s = MPI_Wtime();
-    path_s = (seq_aStar(start_point, destination, grid));
-    spath = &path_s;
-    double end_s = MPI_Wtime();
-    if(!rank){
-      
-      if (spath->size() != 0) {
-          cout <<"Path length: "<< spath->size() << endl;
-          for (auto n = spath->rbegin(); n != spath->rend(); n++) {
-            cout << "(" <<  *n / grid->dim << "," << *n % grid->dim << ") "; 
-          }
-          cout<<endl;
       }
+      filename = argv[++i];
+      continue;
     }
-    vector<int>* path = new vector<int>;
-    double start = MPI_Wtime();
-    parallel_aStar(start_point, destination, grid, path, nproc, rank);
-    double end = MPI_Wtime();
-    if(!rank){
-      cout<<"Ending time :: Serial: "<<end - start<<endl;
-      
-      if (spath->size() != 0) {
-          cout <<"Path length: "<<spath->size() << endl;
-          for (auto n = spath->rbegin(); n != spath->rend(); n++) {
-            cout << "(" <<  *n / grid->dim << "," << *n % grid->dim << ") "; 
-          }
-          cout<<endl;
+
+    try {
+      coords.push_back(std::stoi(arg));
+    } catch (const std::exception&) {
+      if (rank == ROOT_RANK) {
+        std::cerr << "Error: invalid integer argument '" << arg << "'\n";
       }
-      cout<<"Execution Time  :: Parallel:  "<<end_s - start_s<<endl;
+      MPI_Finalize();
+      return -1;
     }
-    
+  }
+
+  if (coords.size() != 4) {
+    if (rank == ROOT_RANK) {
+      std::cerr << "Usage: " << argv[0] << " -f <filename> <x1> <y1> <x2> <y2>\n";
+    }
     MPI_Finalize();
-    
-    delete path;
-    free(grid->grid);
-    return 0;
-}
+    return -1;
+  }
 
+  const int start_row = coords[0];
+  const int start_col = coords[1];
+  const int goal_row = coords[2];
+  const int goal_col = coords[3];
+
+  Grid grid;
+  std::string error;
+  if (!read_grid(filename, start_row, start_col, goal_row, goal_col, grid, error)) {
+    if (rank == ROOT_RANK) {
+      std::cerr << "Input error: " << error << '\n';
+    }
+    MPI_Finalize();
+    return -1;
+  }
+
+  const int start = grid.node(start_row, start_col);
+  const int goal = grid.node(goal_row, goal_col);
+
+  std::vector<int> serial_path;
+  double serial_time = 0.0;
+
+  if (rank == ROOT_RANK) {
+    const double serial_start = MPI_Wtime();
+    serial_path = seq_aStar(start, goal, grid);
+    serial_time = MPI_Wtime() - serial_start;
+  }
+
+  MPI_Datatype node_update_type = create_node_update_type();
+
+  // Barriers keep the parallel timing window aligned across ranks.
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double parallel_start = MPI_Wtime();
+  ParallelResult parallel_result = parallel_aStar(start, goal, grid, nproc, rank, node_update_type);
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double local_parallel_time = MPI_Wtime() - parallel_start;
+
+  double parallel_time = 0.0;
+  MPI_Reduce(&local_parallel_time,
+             &parallel_time,
+             1,
+             MPI_DOUBLE,
+             MPI_MAX,
+             ROOT_RANK,
+             MPI_COMM_WORLD);
+
+  MPI_Type_free(&node_update_type);
+
+  if (rank == ROOT_RANK) {
+    const bool serial_found = !serial_path.empty();
+    const int serial_cost = path_cost(serial_path);
+    const bool parallel_found = parallel_result.found;
+    const int parallel_cost = parallel_result.goal_cost;
+
+    const bool correctness_pass =
+        serial_found == parallel_found &&
+        (!serial_found || (serial_cost == parallel_cost && parallel_result.path_valid));
+
+    std::cout << "Serial path cost: ";
+    if (serial_found) {
+      std::cout << serial_cost << '\n';
+    } else {
+      std::cout << "NO PATH\n";
+    }
+    std::cout << "Serial path nodes: " << serial_path.size() << '\n';
+    std::cout << "Serial path: ";
+    print_path(std::cout, serial_path, grid);
+    std::cout << "Serial time: " << serial_time << " seconds\n\n";
+
+    std::cout << "Parallel path cost: ";
+    if (parallel_found) {
+      std::cout << parallel_cost << '\n';
+    } else {
+      std::cout << "NO PATH\n";
+    }
+    std::cout << "Parallel path nodes: " << parallel_result.path.size() << '\n';
+    std::cout << "Parallel path: ";
+    print_path(std::cout, parallel_result.path, grid);
+    std::cout << "Parallel time: " << parallel_time << " seconds\n";
+
+    if (parallel_time > 0.0) {
+      std::cout << "Speedup: " << (serial_time / parallel_time) << '\n';
+    } else {
+      std::cout << "Speedup: inf\n";
+    }
+
+    std::cout << "Correctness: " << (correctness_pass ? "PASS" : "FAIL") << '\n';
+    if (parallel_found && !parallel_result.path_valid) {
+      std::cout << "Parallel path reconstruction failed validation.\n";
+    }
+  }
+
+  MPI_Finalize();
+  return 0;
+}

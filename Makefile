@@ -1,8 +1,8 @@
 APP_NAME=A_Star
 OBJS += A_Star.o
 
-CXX = mpic++ -std=c++11
-CXXFLAGS = -I. -O0 -g 
+CXX = mpic++
+CXXFLAGS = -I. -std=c++17 -O2 -Wall -Wextra -pedantic
 
 default: $(APP_NAME)
 
